@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from supabase import create_client, create_async_client, Client
 import instaloader
 import requests
+import json
 
 load_dotenv()
 
@@ -27,6 +28,13 @@ elif SUPABASE_URL.endswith('/rest/v1'):
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 task_queue = queue.Queue()
 queued_creator_ids = set()
+
+def log_failure(creator_id: str, handle: str, reason: str):
+    try:
+        supabase.table("Creator").update({"pfpError": reason}).eq("id", creator_id).execute()
+        print(f"Logged failure in Supabase DB (pfpError) for Creator {creator_id} (@{handle}): {reason}")
+    except Exception as e:
+        print(f"Error logging failure to Supabase DB for Creator {creator_id}: {e}")
 
 def extract_handle(raw_handle: str) -> str:
     if not raw_handle:
@@ -67,6 +75,7 @@ def worker():
         
         if not handle:
             print(f"Invalid handle '{raw_handle}' for creator {creator_id}. Skipping.")
+            log_failure(creator_id, raw_handle, "Invalid or missing handle format")
             task_queue.task_done()
             continue
             
@@ -85,7 +94,8 @@ def worker():
                                 jpg_file = os.path.join(root, file)
                                 break
                 except Exception as inner_e:
-                    error_msg = str(inner_e).lower()
+                    inner_error_reason = str(inner_e)
+                    error_msg = inner_error_reason.lower()
                     if "401" in error_msg or "429" in error_msg or "rate" in error_msg or "too many" in error_msg or "please wait" in error_msg or "login" in error_msg:
                         raise inner_e  # Pass rate limits up to trigger cooldown
                     else:
@@ -114,24 +124,31 @@ def worker():
                         
                     public_url = supabase.storage.from_("profile-picture").get_public_url(file_name)
                     print(f"Updating Creator {creator_id} profileImage URL: {public_url}")
-                    supabase.table("Creator").update({"profileImage": public_url}).eq("id", creator_id).execute()
+                    supabase.table("Creator").update({"profileImage": public_url, "pfpError": None}).eq("id", creator_id).execute()
                     print(f"Successfully updated @{handle}.")
                 else:
-                    print(f"Could not find a downloaded jpg for @{handle}.")
+                    reason = "Profile picture not found (Instaloader + Fallback failed)"
+                    if 'inner_error_reason' in locals():
+                        if "404" in inner_error_reason.lower() or "does not exist" in inner_error_reason.lower():
+                            reason = "Account not found / deleted (404)"
+                        elif "400" in inner_error_reason.lower() or "schema" in inner_error_reason.lower() or "asset" in inner_error_reason.lower():
+                            reason = f"Account configuration / Schema error: {inner_error_reason}"
+                        else:
+                            reason = f"Instaloader error: {inner_error_reason}"
+                    log_failure(creator_id, handle, reason)
+                    print(f"Could not find a downloaded jpg for @{handle}. Logged failure and removing creator from queue.")
                     
         except Exception as e:
             error_msg = str(e).lower()
             if "401" in error_msg or "429" in error_msg or "rate" in error_msg or "too many" in error_msg or "please wait" in error_msg or "login" in error_msg:
                 print(f"Rate limit or Auth error hit for @{handle}: {e}")
-                print("Re-enqueueing handle and pausing worker for 15 minutes...")
-                if creator_id in queued_creator_ids:
-                    queued_creator_ids.remove(creator_id)
-                enqueue_creator(creator_id, raw_handle)
+                print("Removing creator from queue for this session and pausing worker for 15 minutes...")
                 task_queue.task_done()
                 time.sleep(900)  # 15 minutes cooldown
                 continue
             else:
-                print(f"Error processing @{handle}: {e}")
+                log_failure(creator_id, handle, f"Processing Error: {e}")
+                print(f"Error processing @{handle}: {e}. Logged failure and removing creator from queue.")
             
         task_queue.task_done()
         print("Sleeping for 60 seconds to avoid IG rate limits...")
@@ -145,8 +162,8 @@ def enqueue_creator(creator_id, handle):
 
 def poll_unprocessed_creators():
     try:
-        # Get creators without profileImage
-        creators_res = supabase.table("Creator").select("id").is_("profileImage", "null").execute()
+        # Get creators without profileImage and without a previous pfpError
+        creators_res = supabase.table("Creator").select("id").is_("profileImage", "null").is_("pfpError", "null").execute()
         creators_without_pic = creators_res.data or []
         
         if not creators_without_pic:

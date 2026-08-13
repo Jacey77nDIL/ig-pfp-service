@@ -5,9 +5,10 @@ An automated Python background service that fetches profile pictures for Instagr
 ## Features
 
 - **Hybrid Listener & Polling**: Uses Supabase Realtime to listen for new `INSTAGRAM` creator rows added to `CreatorPlatform`, while running a periodic 30-second poll to ensure no inserts are missed.
-- **Initial Backfill Sweep**: Scans the database on startup and automatically queues all existing creators who are missing a profile picture.
-- **Rate Limit & Cooldown**: Throttles Instagram requests to 1 handle per 60 seconds. Automatically detects 401/429 rate limit responses, re-enqueues the handle, and pauses the worker for 15 minutes to let the IP cool down.
+- **Initial Backfill Sweep**: Scans the database on startup and automatically queues all existing creators who are missing a profile picture and haven't previously errored out (`profileImage IS NULL AND pfpError IS NULL`).
+- **Rate Limit & Cooldown**: Throttles Instagram requests to 1 handle per 60 seconds. Automatically detects 401/429 rate limit responses and pauses the worker for 15 minutes to let the IP cool down.
 - **HTML Fallback**: Includes a fallback parser that extracts public profile pictures directly from Instagram's HTML meta tags (`og:image`) if `instaloader` hits schema or API errors on business/creator accounts.
+- **Database Failure Reporting (`pfpError`)**: If a creator fails to process (e.g. 404 account not found, 400 schema error, invalid handle format), the failure reason is recorded directly into the `pfpError` column in Supabase, leaving `profileImage` untouched (`NULL`). This ensures remote execution writes no local files and allows polling to skip failed handles automatically.
 
 ## Prerequisites
 
