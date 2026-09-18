@@ -5,11 +5,16 @@ import queue
 import tempfile
 import asyncio
 import re
+import sys
 from dotenv import load_dotenv
 from supabase import create_client, create_async_client, Client
 import requests
 import json
 import random
+
+USE_INSTALOADER = "--instaloader" in sys.argv
+if USE_INSTALOADER:
+    import instaloader
 
 load_dotenv()
 
@@ -115,35 +120,54 @@ def worker():
                 jpg_file = None
                 failure_reason = None
                 
-                # 1. Fast mobile HTML scraper (og:image)
-                img_url, html_err = get_ig_pfp_mobile_html(handle)
-                
-                # Check for Instagram rate challenge / login wall
-                if html_err == "LOGIN_WALL":
-                    print(f"[{time.strftime('%X')}] [Instagram Login Wall / Rate Challenge] Instagram served a login challenge for @{handle}.")
-                    print(f"--> Temporary challenge detected on your IP. NOT logging failure in Supabase.")
-                    print(f"--> Re-queueing @{handle} and entering 10-minute cooldown before retrying...")
-                    queued_creator_ids.discard(creator_id)
-                    task_queue.put(item)
-                    task_queue.task_done()
-                    time.sleep(600)  # 10 minutes cooldown
-                    continue
-
-                if img_url:
-                    print(f"Found profile picture via mobile HTML for @{handle}. Downloading...")
-                    img_resp = requests.get(img_url, headers={
-                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
-                    }, timeout=15)
-                    if img_resp.status_code == 200:
-                        jpg_file = os.path.join(tmpdirname, f"{creator_id}.jpg")
-                        with open(jpg_file, 'wb') as f:
-                            f.write(img_resp.content)
-                    else:
-                        failure_reason = f"Failed to download image from CDN (HTTP {img_resp.status_code})"
-                        print(f"@{handle}: {failure_reason}")
+                if USE_INSTALOADER:
+                    # Instaloader Exclusive Mode
+                    print(f"[Instaloader] Downloading profile pic for @{handle}...")
+                    L = instaloader.Instaloader()
+                    ig_session = os.environ.get("IG_SESSION_ID")
+                    if ig_session:
+                        L.context._session.cookies.set("sessionid", ig_session.strip(), domain=".instagram.com")
+                    try:
+                        L.dirname_pattern = tmpdirname
+                        L.download_profile(handle, profile_pic_only=True)
+                        for root, dirs, files in os.walk(tmpdirname):
+                            for file in files:
+                                if file.endswith('.jpg'):
+                                    jpg_file = os.path.join(root, file)
+                                    break
+                    except Exception as ie:
+                        failure_reason = f"Instaloader error: {ie}"
+                        print(f"Instaloader failed for @{handle}: {ie}")
                 else:
-                    print(f"Mobile HTML scraper did not find picture for @{handle}: {html_err}")
-                    failure_reason = html_err
+                    # Fast mobile HTML scraper (og:image)
+                    img_url, html_err = get_ig_pfp_mobile_html(handle)
+                    
+                    # Check for Instagram rate challenge / login wall
+                    if html_err == "LOGIN_WALL":
+                        print(f"[{time.strftime('%X')}] [Instagram Login Wall / Rate Challenge] Instagram served a login challenge for @{handle}.")
+                        print(f"--> Temporary challenge detected on your IP. NOT logging failure in Supabase.")
+                        print(f"--> Re-queueing @{handle} and entering 10-minute cooldown before retrying...")
+                        queued_creator_ids.discard(creator_id)
+                        task_queue.put(item)
+                        task_queue.task_done()
+                        time.sleep(600)  # 10 minutes cooldown
+                        continue
+
+                    if img_url:
+                        print(f"Found profile picture via mobile HTML for @{handle}. Downloading...")
+                        img_resp = requests.get(img_url, headers={
+                            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
+                        }, timeout=15)
+                        if img_resp.status_code == 200:
+                            jpg_file = os.path.join(tmpdirname, f"{creator_id}.jpg")
+                            with open(jpg_file, 'wb') as f:
+                                f.write(img_resp.content)
+                        else:
+                            failure_reason = f"Failed to download image from CDN (HTTP {img_resp.status_code})"
+                            print(f"@{handle}: {failure_reason}")
+                    else:
+                        print(f"Mobile HTML scraper did not find picture for @{handle}: {html_err}")
+                        failure_reason = html_err
                             
                 if jpg_file:
                     file_name = f"{creator_id}.jpg"
@@ -239,6 +263,11 @@ async def listen_and_poll():
         poll_unprocessed_creators()
 
 if __name__ == "__main__":
+    if USE_INSTALOADER:
+        print("=== Running in INSTALOADER EXCLUSIVE mode (--instaloader flag) ===")
+    else:
+        print("=== Running in MOBILE HTML SCRAPER mode (default) ===")
+
     t = threading.Thread(target=worker, daemon=True)
     t.start()
     
