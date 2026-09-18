@@ -7,9 +7,9 @@ import asyncio
 import re
 from dotenv import load_dotenv
 from supabase import create_client, create_async_client, Client
-import instaloader
 import requests
 import json
+import random
 
 load_dotenv()
 
@@ -46,24 +46,53 @@ def extract_handle(raw_handle: str) -> str:
         return username
     return raw_handle.lstrip("@").strip()
 
-def get_ig_pfp_fallback(handle: str) -> str:
+def get_ig_pfp_mobile_html(handle: str):
     url = f"https://www.instagram.com/{handle}/"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document"
     }
+    cookies = {}
+    ig_session = os.environ.get("IG_SESSION_ID")
+    if ig_session:
+        cookies["sessionid"] = ig_session.strip()
+
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, cookies=cookies, timeout=15)
+        
+        # Detect Instagram Login Wall / IP Rate Limit Challenge
+        title_match = re.search(r'<title>(.*?)</title>', resp.text, re.IGNORECASE)
+        page_title = title_match.group(1).strip() if title_match else ""
+        is_login_wall = (
+            resp.status_code == 429 or
+            page_title.lower() == "instagram" or
+            "/accounts/login" in resp.url or
+            "/login/" in resp.url
+        )
+        if is_login_wall:
+            return None, "LOGIN_WALL"
+
         if resp.status_code == 200:
             match = re.search(r'<meta property="og:image" content="([^"]+)"', resp.text)
             if match:
                 img_url = match.group(1).replace("&amp;", "&")
-                return img_url
+                return img_url, None
+            match_json = re.search(r'"profile_pic_url_hd":"([^"]+)"', resp.text) or re.search(r'"profile_pic_url":"([^"]+)"', resp.text)
+            if match_json:
+                return match_json.group(1).encode().decode('unicode-escape').replace('\\/', '/'), None
+            return None, "Profile image meta tag not found"
+        elif resp.status_code == 404:
+            return None, "Account not found / deleted (404)"
+        else:
+            return None, f"HTTP {resp.status_code}"
     except Exception as e:
-        print(f"Fallback request failed for @{handle}: {e}")
-    return None
+        return None, f"Request error: {e}"
 
 def worker():
-    L = instaloader.Instaloader()
     while True:
         item = task_queue.get()
         if item is None:
@@ -84,32 +113,37 @@ def worker():
             
             with tempfile.TemporaryDirectory() as tmpdirname:
                 jpg_file = None
-                try:
-                    L.dirname_pattern = tmpdirname
-                    L.download_profile(handle, profile_pic_only=True)
-                    
-                    for root, dirs, files in os.walk(tmpdirname):
-                        for file in files:
-                            if file.endswith('.jpg'):
-                                jpg_file = os.path.join(root, file)
-                                break
-                except Exception as inner_e:
-                    inner_error_reason = str(inner_e)
-                    error_msg = inner_error_reason.lower()
-                    if "401" in error_msg or "429" in error_msg or "rate" in error_msg or "too many" in error_msg or "please wait" in error_msg or "login" in error_msg:
-                        raise inner_e  # Pass rate limits up to trigger cooldown
+                failure_reason = None
+                
+                # 1. Fast mobile HTML scraper (og:image)
+                img_url, html_err = get_ig_pfp_mobile_html(handle)
+                
+                # Check for Instagram rate challenge / login wall
+                if html_err == "LOGIN_WALL":
+                    print(f"[{time.strftime('%X')}] [Instagram Login Wall / Rate Challenge] Instagram served a login challenge for @{handle}.")
+                    print(f"--> Temporary challenge detected on your IP. NOT logging failure in Supabase.")
+                    print(f"--> Re-queueing @{handle} and entering 10-minute cooldown before retrying...")
+                    queued_creator_ids.discard(creator_id)
+                    task_queue.put(item)
+                    task_queue.task_done()
+                    time.sleep(600)  # 10 minutes cooldown
+                    continue
+
+                if img_url:
+                    print(f"Found profile picture via mobile HTML for @{handle}. Downloading...")
+                    img_resp = requests.get(img_url, headers={
+                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
+                    }, timeout=15)
+                    if img_resp.status_code == 200:
+                        jpg_file = os.path.join(tmpdirname, f"{creator_id}.jpg")
+                        with open(jpg_file, 'wb') as f:
+                            f.write(img_resp.content)
                     else:
-                        print(f"Instaloader failed for @{handle} ({inner_e}). Trying HTML fallback...")
-                        img_url = get_ig_pfp_fallback(handle)
-                        if img_url:
-                            print(f"Fallback successful! Downloading image from {img_url[:40]}...")
-                            img_resp = requests.get(img_url, timeout=10)
-                            if img_resp.status_code == 200:
-                                jpg_file = os.path.join(tmpdirname, f"{creator_id}.jpg")
-                                with open(jpg_file, 'wb') as f:
-                                    f.write(img_resp.content)
-                        else:
-                            print(f"Fallback failed to find profile picture for @{handle}.")
+                        failure_reason = f"Failed to download image from CDN (HTTP {img_resp.status_code})"
+                        print(f"@{handle}: {failure_reason}")
+                else:
+                    print(f"Mobile HTML scraper did not find picture for @{handle}: {html_err}")
+                    failure_reason = html_err
                             
                 if jpg_file:
                     file_name = f"{creator_id}.jpg"
@@ -127,32 +161,18 @@ def worker():
                     supabase.table("Creator").update({"profileImage": public_url, "pfpError": None}).eq("id", creator_id).execute()
                     print(f"Successfully updated @{handle}.")
                 else:
-                    reason = "Profile picture not found (Instaloader + Fallback failed)"
-                    if 'inner_error_reason' in locals():
-                        if "404" in inner_error_reason.lower() or "does not exist" in inner_error_reason.lower():
-                            reason = "Account not found / deleted (404)"
-                        elif "400" in inner_error_reason.lower() or "schema" in inner_error_reason.lower() or "asset" in inner_error_reason.lower():
-                            reason = f"Account configuration / Schema error: {inner_error_reason}"
-                        else:
-                            reason = f"Instaloader error: {inner_error_reason}"
+                    reason = failure_reason or "Profile picture not found"
                     log_failure(creator_id, handle, reason)
-                    print(f"Could not find a downloaded jpg for @{handle}. Logged failure and removing creator from queue.")
+                    print(f"Could not retrieve profile picture for @{handle}. Logged failure: {reason}")
                     
         except Exception as e:
-            error_msg = str(e).lower()
-            if "401" in error_msg or "429" in error_msg or "rate" in error_msg or "too many" in error_msg or "please wait" in error_msg or "login" in error_msg:
-                print(f"Rate limit or Auth error hit for @{handle}: {e}")
-                print("Removing creator from queue for this session and pausing worker for 15 minutes...")
-                task_queue.task_done()
-                time.sleep(900)  # 15 minutes cooldown
-                continue
-            else:
-                log_failure(creator_id, handle, f"Processing Error: {e}")
-                print(f"Error processing @{handle}: {e}. Logged failure and removing creator from queue.")
+            log_failure(creator_id, handle, f"Processing Error: {e}")
+            print(f"Error processing @{handle}: {e}. Logged failure and continuing.")
             
         task_queue.task_done()
-        print("Sleeping for 60 seconds to avoid IG rate limits...")
-        time.sleep(60)
+        # Randomized pacing delay (10-18s) to avoid tripping Instagram bot filters
+        delay = random.uniform(10, 18)
+        time.sleep(delay)
 
 def enqueue_creator(creator_id, handle):
     if creator_id not in queued_creator_ids:
