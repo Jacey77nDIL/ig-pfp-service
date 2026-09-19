@@ -1,273 +1,221 @@
 import os
-import time
-import threading
-import queue
-import tempfile
-import asyncio
-import re
 import sys
-from dotenv import load_dotenv
-from supabase import create_client, create_async_client, Client
-import requests
-import json
+import time
+import queue
+import threading
+import asyncio
+import tempfile
 import random
-
-USE_INSTALOADER = "--instaloader" in sys.argv
-if USE_INSTALOADER:
-    import instaloader
+import requests
+import re
+import io
+from PIL import Image, ImageEnhance
+from dotenv import load_dotenv
+from supabase import create_client, create_async_client
 
 load_dotenv()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Missing Supabase credentials in .env")
-
-if SUPABASE_URL.endswith('/rest/v1/'):
+if SUPABASE_URL and SUPABASE_URL.endswith("/rest/v1/"):
     SUPABASE_URL = SUPABASE_URL[:-9]
-elif SUPABASE_URL.endswith('/rest/v1'):
+elif SUPABASE_URL and SUPABASE_URL.endswith("/rest/v1"):
     SUPABASE_URL = SUPABASE_URL[:-8]
 
-# Sync client for database queries & storage uploads
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+BUCKET_NAME = "profile-picture"
+
 task_queue = queue.Queue()
 queued_creator_ids = set()
 
-def log_failure(creator_id: str, handle: str, reason: str):
-    try:
-        supabase.table("Creator").update({"pfpError": reason}).eq("id", creator_id).execute()
-        print(f"Logged failure in Supabase DB (pfpError) for Creator {creator_id} (@{handle}): {reason}")
-    except Exception as e:
-        print(f"Error logging failure to Supabase DB for Creator {creator_id}: {e}")
+WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
-def extract_handle(raw_handle: str) -> str:
-    if not raw_handle:
-        return ""
-    raw_handle = raw_handle.strip()
-    if "instagram.com/" in raw_handle:
-        parts = raw_handle.split("instagram.com/")[1]
-        username = parts.split("/")[0].split("?")[0]
-        return username
-    return raw_handle.lstrip("@").strip()
+APP_HEADERS = {
+    "User-Agent": "Instagram 361.0.0.35.82 (iPad13,8; iOS 18_0; en_US; en-US; scale=2.00; 2048x2732; 674117118) AppleWebKit/420+",
+    "x-ig-app-id": "124024574287414",
+}
 
-def get_ig_pfp_mobile_html(handle: str):
-    url = f"https://www.instagram.com/{handle}/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Dest": "document"
-    }
-    cookies = {}
-    ig_session = os.environ.get("IG_SESSION_ID")
-    if ig_session:
-        cookies["sessionid"] = ig_session.strip()
+TIKTOK_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
-    try:
-        resp = requests.get(url, headers=headers, cookies=cookies, timeout=15)
+def extract_handle(raw):
+    if not raw: return ""
+    raw = raw.strip()
+    if "instagram.com/" in raw:
+        return raw.split("instagram.com/")[1].split("/")[0].split("?")[0]
+    if "tiktok.com/@" in raw:
+        return raw.split("tiktok.com/@")[1].split("/")[0].split("?")[0]
+    return raw.lstrip("@").strip()
+
+def hdfy_image_bytes(img_bytes):
+    with Image.open(io.BytesIO(img_bytes)) as img:
+        img = img.convert("RGB")
+        w, h = img.size
         
-        # Detect Instagram Login Wall / IP Rate Limit Challenge
-        title_match = re.search(r'<title>(.*?)</title>', resp.text, re.IGNORECASE)
-        page_title = title_match.group(1).strip() if title_match else ""
-        is_login_wall = (
-            resp.status_code == 429 or
-            page_title.lower() == "instagram" or
-            "/accounts/login" in resp.url or
-            "/login/" in resp.url
-        )
-        if is_login_wall:
-            return None, "LOGIN_WALL"
+        # If dimensions < 720x720, upscale to 1080x1080 with Lanczos resampling and sharpening
+        if w < 720 or h < 720:
+            target_size = (1080, 1080)
+            img = img.resize(target_size, Image.Resampling.LANCZOS)
+            enhancer = ImageEnhance.Sharpen(img)
+            img = enhancer.enhance(1.25)
+            contrast = ImageEnhance.Contrast(img)
+            img = contrast.enhance(1.04)
+        
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=95, subsampling=0)
+        final_bytes = out.getvalue()
+        return final_bytes, img.size[0], img.size[1]
 
-        if resp.status_code == 200:
-            match = re.search(r'<meta property="og:image" content="([^"]+)"', resp.text)
-            if match:
-                img_url = match.group(1).replace("&amp;", "&")
-                return img_url, None
-            match_json = re.search(r'"profile_pic_url_hd":"([^"]+)"', resp.text) or re.search(r'"profile_pic_url":"([^"]+)"', resp.text)
-            if match_json:
-                return match_json.group(1).encode().decode('unicode-escape').replace('\\/', '/'), None
-            return None, "Profile image meta tag not found"
-        elif resp.status_code == 404:
-            return None, "Account not found / deleted (404)"
-        else:
-            return None, f"HTTP {resp.status_code}"
-    except Exception as e:
-        return None, f"Request error: {e}"
+def upload_to_supabase(creator_id, img_bytes):
+    final_jpeg, w, h = hdfy_image_bytes(img_bytes)
+    file_name = f"{creator_id}.jpg"
+    
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "image/jpeg",
+        "x-upsert": "true",
+    }
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET_NAME}/{file_name}"
+    resp = requests.post(upload_url, headers=headers, data=final_jpeg, timeout=30)
+    if resp.status_code not in [200, 201]:
+        raise Exception(f"Storage upload error: HTTP {resp.status_code} {resp.text}")
+    
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET_NAME}/{file_name}"
+    supabase.table("Creator").update({"profileImage": public_url, "pfpError": None}).eq("id", creator_id).execute()
+    return public_url, w, h, len(final_jpeg)
+
+def fetch_tiktok_avatar(handle):
+    h = extract_handle(handle)
+    resp = requests.get(f"https://www.tiktok.com/@{h}", headers=TIKTOK_HEADERS, timeout=20)
+    if resp.status_code != 200:
+        return None
+    avatars = re.findall(r""avatarLarger":"([^"]+)"", resp.text) or re.findall(r""avatarMedium":"([^"]+)"", resp.text)
+    if avatars:
+        return avatars[0].encode().decode("unicode-escape").replace(r"\/", "/")
+    og = re.findall(r"property=["']og:image["']\s+content=["']([^'"]+)["']", resp.text)
+    if og: return og[0]
+    return None
+
+def fetch_ig_hd_avatar(handle):
+    h = extract_handle(handle)
+    ig_session = os.environ.get("IG_SESSION_ID", "").strip()
+    cookies = {"sessionid": ig_session} if ig_session else {}
+    
+    resp = requests.get(f"https://www.instagram.com/{h}/", headers=WEB_HEADERS, cookies=cookies, timeout=20)
+    if resp.status_code == 200:
+        m = re.search(r"PolarisProfile[^"]*Root\.react"\},"props":\{"id":"(\d+)"", resp.text) or re.search(r""id":"(\d+)","show_suggested_profiles"", resp.text)
+        if m and ig_session:
+            uid = m.group(1)
+            r_info = requests.get(f"https://i.instagram.com/api/v1/users/{uid}/info/", headers=APP_HEADERS, cookies=cookies, timeout=25)
+            if r_info.status_code == 200:
+                user = r_info.json().get("user", {})
+                hd_info = user.get("hd_profile_pic_url_info") or {}
+                if hd_info.get("url"): return hd_info["url"]
+                vers = user.get("hd_profile_pic_versions") or []
+                if vers and vers[0].get("url"): return vers[0]["url"]
+        
+        m_og = re.findall(r"property=["']og:image["']\s+content=["']([^'"]+)["']", resp.text)
+        if m_og:
+            return m_og[0].replace("&amp;", "&")
+    return None
+
+def process_creator(cid):
+    platforms = supabase.table("CreatorPlatform").select("platform, handle").eq("creatorId", cid).execute().data or []
+    
+    img_url = None
+    source = None
+
+    # Tier 1: Try Instagram True HD if handle available
+    ig_plat = next((p for p in platforms if p["platform"] == "INSTAGRAM"), None)
+    if ig_plat:
+        h = extract_handle(ig_plat["handle"])
+        img_url = fetch_ig_hd_avatar(h)
+        if img_url:
+            source = f"Instagram (@{h})"
+
+    # Tier 2: Try TikTok avatarLarger HD if no IG image
+    if not img_url:
+        tt_plat = next((p for p in platforms if p["platform"] == "TIKTOK"), None)
+        if tt_plat:
+            h = extract_handle(tt_plat["handle"])
+            img_url = fetch_tiktok_avatar(h)
+            if img_url:
+                source = f"TikTok (@{h})"
+
+    if img_url:
+        r_img = requests.get(img_url, timeout=25)
+        if r_img.status_code == 200:
+            pub_url, w, h, nbytes = upload_to_supabase(cid, r_img.content)
+            print(f"[{time.strftime(%X)}] SUCCESS! Creator {cid} -> {w}x{h} ({nbytes} bytes) from {source}")
+            return True
+    
+    supabase.table("Creator").update({"pfpError": "Could not retrieve HD profile picture"}).eq("id", cid).execute()
+    print(f"[{time.strftime(%X)}] FAILED for Creator {cid}")
+    return False
 
 def worker():
+    print(f"[{time.strftime(%X)}] Worker thread started.")
     while True:
-        item = task_queue.get()
-        if item is None:
-            break
-            
-        creator_id = item['creatorId']
-        raw_handle = item['handle']
-        handle = extract_handle(raw_handle)
-        
-        if not handle:
-            print(f"Invalid handle '{raw_handle}' for creator {creator_id}. Skipping.")
-            log_failure(creator_id, raw_handle, "Invalid or missing handle format")
-            task_queue.task_done()
-            continue
-            
         try:
-            print(f"[{time.strftime('%X')}] Processing IG handle @{handle} for creator {creator_id}...")
-            
-            with tempfile.TemporaryDirectory() as tmpdirname:
-                jpg_file = None
-                failure_reason = None
-                
-                if USE_INSTALOADER:
-                    # Instaloader Exclusive Mode
-                    print(f"[Instaloader] Downloading profile pic for @{handle}...")
-                    L = instaloader.Instaloader()
-                    ig_session = os.environ.get("IG_SESSION_ID")
-                    if ig_session:
-                        L.context._session.cookies.set("sessionid", ig_session.strip(), domain=".instagram.com")
-                    try:
-                        L.dirname_pattern = tmpdirname
-                        L.download_profile(handle, profile_pic_only=True)
-                        for root, dirs, files in os.walk(tmpdirname):
-                            for file in files:
-                                if file.endswith('.jpg'):
-                                    jpg_file = os.path.join(root, file)
-                                    break
-                    except Exception as ie:
-                        failure_reason = f"Instaloader error: {ie}"
-                        print(f"Instaloader failed for @{handle}: {ie}")
-                else:
-                    # Fast mobile HTML scraper (og:image)
-                    img_url, html_err = get_ig_pfp_mobile_html(handle)
-                    
-                    # Check for Instagram rate challenge / login wall
-                    if html_err == "LOGIN_WALL":
-                        print(f"[{time.strftime('%X')}] [Instagram Login Wall / Rate Challenge] Instagram served a login challenge for @{handle}.")
-                        print(f"--> Temporary challenge detected on your IP. NOT logging failure in Supabase.")
-                        print(f"--> Re-queueing @{handle} and entering 10-minute cooldown before retrying...")
-                        queued_creator_ids.discard(creator_id)
-                        task_queue.put(item)
-                        task_queue.task_done()
-                        time.sleep(600)  # 10 minutes cooldown
-                        continue
+            cid = task_queue.get(timeout=5)
+        except queue.Empty:
+            time.sleep(1)
+            continue
 
-                    if img_url:
-                        print(f"Found profile picture via mobile HTML for @{handle}. Downloading...")
-                        img_resp = requests.get(img_url, headers={
-                            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
-                        }, timeout=15)
-                        if img_resp.status_code == 200:
-                            jpg_file = os.path.join(tmpdirname, f"{creator_id}.jpg")
-                            with open(jpg_file, 'wb') as f:
-                                f.write(img_resp.content)
-                        else:
-                            failure_reason = f"Failed to download image from CDN (HTTP {img_resp.status_code})"
-                            print(f"@{handle}: {failure_reason}")
-                    else:
-                        print(f"Mobile HTML scraper did not find picture for @{handle}: {html_err}")
-                        failure_reason = html_err
-                            
-                if jpg_file:
-                    file_name = f"{creator_id}.jpg"
-                    print(f"Uploading {file_name} to Supabase bucket 'profile-picture'...")
-                    
-                    with open(jpg_file, 'rb') as f:
-                        supabase.storage.from_("profile-picture").upload(
-                            file=f,
-                            path=file_name,
-                            file_options={"content-type": "image/jpeg", "upsert": "true"}
-                        )
-                        
-                    public_url = supabase.storage.from_("profile-picture").get_public_url(file_name)
-                    print(f"Updating Creator {creator_id} profileImage URL: {public_url}")
-                    supabase.table("Creator").update({"profileImage": public_url, "pfpError": None}).eq("id", creator_id).execute()
-                    print(f"Successfully updated @{handle}.")
-                else:
-                    reason = failure_reason or "Profile picture not found"
-                    log_failure(creator_id, handle, reason)
-                    print(f"Could not retrieve profile picture for @{handle}. Logged failure: {reason}")
-                    
+        try:
+            process_creator(cid)
         except Exception as e:
-            log_failure(creator_id, handle, f"Processing Error: {e}")
-            print(f"Error processing @{handle}: {e}. Logged failure and continuing.")
-            
-        task_queue.task_done()
-        # Randomized pacing delay (10-18s) to avoid tripping Instagram bot filters
-        delay = random.uniform(10, 18)
-        time.sleep(delay)
+            print(f"Worker exception for {cid}: {e}")
+        finally:
+            queued_creator_ids.discard(cid)
+            task_queue.task_done()
+            time.sleep(1.5)
 
-def enqueue_creator(creator_id, handle):
-    if creator_id not in queued_creator_ids:
-        queued_creator_ids.add(creator_id)
-        print(f"Queued IG handle @{handle} for creator {creator_id}")
-        task_queue.put({'creatorId': creator_id, 'handle': handle})
+def enqueue_creator(cid):
+    if cid not in queued_creator_ids:
+        queued_creator_ids.add(cid)
+        task_queue.put(cid)
 
 def poll_unprocessed_creators():
     try:
-        # Get creators without profileImage and without a previous pfpError
-        creators_res = supabase.table("Creator").select("id").is_("profileImage", "null").is_("pfpError", "null").execute()
-        creators_without_pic = creators_res.data or []
-        
-        if not creators_without_pic:
-            return
-
-        missing_ids = [c["id"] for c in creators_without_pic]
-        
-        # Query CreatorPlatform for INSTAGRAM handles of these creators
-        platforms_res = supabase.table("CreatorPlatform").select("creatorId, handle").eq("platform", "INSTAGRAM").in_("creatorId", missing_ids).execute()
-        
-        for record in (platforms_res.data or []):
-            enqueue_creator(record["creatorId"], record["handle"])
+        res = supabase.table("Creator").select("id").is_("profileImage", "null").is_("pfpError", "null").execute()
+        for c in (res.data or []):
+            enqueue_creator(c["id"])
     except Exception as e:
         print(f"Polling error: {e}")
 
 async def listen_and_poll():
-    # 1. First sweep of existing creators
     print("Performing initial sweep for creators missing profile pictures...")
     poll_unprocessed_creators()
     
-    # 2. Setup Realtime subscription
     try:
-        print("Connecting to Supabase Realtime async client...")
         async_supabase = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
-        channel = async_supabase.channel("public:CreatorPlatform")
+        channel = async_supabase.channel("public:Creator")
         
         def on_insert(payload):
-            print("Received INSERT event payload:", payload)
-            record = getattr(payload, 'record', {}) or {}
-            platform = record.get('platform', '')
-            if platform and platform.upper() == 'INSTAGRAM':
-                cid = record.get('creatorId')
-                handle = record.get('handle')
-                if cid and handle:
-                    enqueue_creator(cid, handle)
+            record = getattr(payload, "record", {}) or {}
+            cid = record.get("id")
+            if cid and not record.get("profileImage"):
+                enqueue_creator(cid)
                     
-        channel.on_postgres_changes(
-            event="INSERT",
-            schema="public",
-            table="CreatorPlatform",
-            callback=on_insert
-        )
+        channel.on_postgres_changes(event="INSERT", schema="public", table="Creator", callback=on_insert)
         await channel.subscribe()
-        print("Realtime subscribed successfully!")
+        print("Realtime active!")
     except Exception as e:
-        print(f"Realtime setup warning: {e}")
+        print(f"Realtime setup notice: {e}")
 
-    print("Pipeline active! Listening for new creators & polling periodically... (Press Ctrl+C to stop)")
-    
-    # Periodic polling loop every 30s as backstop
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(25)
         poll_unprocessed_creators()
 
 if __name__ == "__main__":
-    if USE_INSTALOADER:
-        print("=== Running in INSTALOADER EXCLUSIVE mode (--instaloader flag) ===")
-    else:
-        print("=== Running in MOBILE HTML SCRAPER mode (default) ===")
-
     t = threading.Thread(target=worker, daemon=True)
     t.start()
     
