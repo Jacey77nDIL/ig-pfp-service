@@ -1,46 +1,72 @@
-# IG-PFP Service (Instagram Profile Picture Downloader)
+# Caskayd Services
 
-An automated Python background service that fetches profile pictures for Instagram creators, uploads them to a Supabase Storage bucket (`profile-picture`), and updates the `profileImage` field in the database `Creator` table.
+An automated Python micro-services suite for Caskayd powering True HD avatar ingestion, avatar refreshes, and automated creator discovery crawling.
 
-## Features
+## Services Overview
 
-- **Hybrid Listener & Polling**: Uses Supabase Realtime to listen for new `INSTAGRAM` creator rows added to `CreatorPlatform`, while running a periodic 30-second poll to ensure no inserts are missed.
-- **Initial Backfill Sweep**: Scans the database on startup and automatically queues all existing creators who are missing a profile picture and haven't previously errored out (`profileImage IS NULL AND pfpError IS NULL`).
-- **Rate Limit & Cooldown**: Throttles Instagram requests to 1 handle per 60 seconds. Automatically detects 401/429 rate limit responses and pauses the worker for 15 minutes to let the IP cool down.
-- **HTML Fallback**: Includes a fallback parser that extracts public profile pictures directly from Instagram's HTML meta tags (`og:image`) if `instaloader` hits schema or API errors on business/creator accounts.
-- **Database Failure Reporting (`pfpError`)**: If a creator fails to process (e.g. 404 account not found, 400 schema error, invalid handle format), the failure reason is recorded directly into the `pfpError` column in Supabase, leaving `profileImage` untouched (`NULL`). This ensures remote execution writes no local files and allows polling to skip failed handles automatically.
+### 1. New Creator HD Avatar Daemon (`main.py`)
+- Automatically listens for newly registered creators who do **not** yet have an avatar (`profileImage IS NULL AND pfpError IS NULL`).
+- Never redownloads or overwrites existing creator profile pictures.
+- **4-Tier Waterfall Scraper**:
+  1. Instagram True HD mobile uncompressed extraction.
+  2. TikTok 1080x1080 True HD avatar extraction.
+  3. Instaloader query.
+  4. Web HTML metadata fallback.
+- **HDfy Engine**: Upscales low-res profile pictures via Lanczos high-order filter and applies subtle unsharp masking for studio-grade clarity.
+- Uploads directly to Supabase Storage (`profile-picture/{creatorId}.jpg`) and updates `Creator.profileImage`.
 
-## Prerequisites
+Run daemon:
+```bash
+python -u main.py
+```
 
-- Python 3.11+
-- Virtual environment set up in `venv/`
-- Environment variables configured in a `.env` file
+---
+
+### 2. Explicit Profile Picture Updater (`update_pfps.py`)
+Explicitly refreshes profile pictures for creators who **already have an image**. Only runs when explicitly triggered.
+
+- Refresh a specific creator:
+  ```bash
+  python update_pfps.py --id <creator_uuid>
+  ```
+- Batch refresh existing creators:
+  ```bash
+  python update_pfps.py --all --limit 50
+  ```
+
+---
+
+### 3. Automated Discovery Crawler Bot (`crawler.py`)
+An intelligent graph-walking discovery crawler that automatically expands Caskayd's creator database.
+
+- **How it works**:
+  - Seeds from top verified creators in the database (or custom seeds).
+  - Queries Instagram's official chaining endpoint (`discover/chaining/?target_id={pk}`) using `IG_SESSION_ID` to discover 70–80 similar creators per seed.
+  - Automatically filters out private accounts, creators already in `Creator`, and handles already in `CreatorSuggestion`.
+  - Ingests new creators directly into the backend `CreatorSuggestion` queue with status `PENDING` for 1-click admin approval.
+
+Run crawler:
+```bash
+# Crawl 50 new creators starting from default verified seeds
+python crawler.py --max 50
+
+# Crawl from custom seed creators
+python crawler.py --seeds hildabaci brodashagi taaooma --max 100
+```
+
+---
 
 ## Environment Variables (`.env`)
-
-Create a `.env` file in the project root:
 
 ```env
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_KEY=your-supabase-service-role-key
+IG_SESSION_ID=your-instagram-session-cookie
 ```
 
-## Setup & Running
+## Setup
 
-1. **Activate the Virtual Environment**:
-   ```bash
-   source venv/bin/activate
-   ```
-
-2. **Install Dependencies** (if needed):
-   ```bash
-   pip install -r requirements.txt
-   ```
-   *(Main packages required: `supabase`, `instaloader`, `requests`, `python-dotenv`)*
-
-3. **Run the Service**:
-   ```bash
-   python -u main.py
-   ```
-
-The `-u` flag ensures log output is unbuffered so you can see live progress in real-time.
+```bash
+source venv/bin/activate
+pip install -r requirements.txt
+```
